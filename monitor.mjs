@@ -95,15 +95,12 @@ try {
     state.itemCount = currentCount;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
     console.log(`Baseline saved: ${currentCount} available submission(s). No notification sent.`);
-  } else if (currentCount > previousCount) {
-    const increase = currentCount - previousCount;
+  } else if (currentCount >= 1) {
     const body = new URLSearchParams({
       token: process.env.PUSHOVER_API_TOKEN,
       user: process.env.PUSHOVER_USER_KEY,
-      title: "Nouvelle soumission SoundCampaign",
-      message: increase === 1
-        ? "Une nouvelle soumission est disponible dans ton Tracks Feed SoundCampaign."
-        : `${increase} nouvelles soumissions sont disponibles dans ton Tracks Feed SoundCampaign.`,
+      title: "Soumissions SoundCampaign disponibles",
+      message: `Il y a actuellement ${currentCount} soumission(s) disponible(s) dans ton Tracks Feed SoundCampaign.`,
       priority: "0",
     });
 
@@ -122,15 +119,11 @@ try {
       throw new Error(`Pushover rejected the notification (HTTP ${pushoverResponse.status}).`);
     }
 
-    console.log(`Notification accepted by Pushover. Available submissions increased from ${previousCount} to ${currentCount}.`);
+    console.log(`Notification accepted by Pushover. ${currentCount} submission(s) currently available.`);
     state.itemCount = currentCount;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
   } else {
-    if (currentCount < previousCount) {
-      console.log(`Available submissions decreased from ${previousCount} to ${currentCount}; baseline updated without notification.`);
-    } else {
-      console.log(`No increase in available submissions (${currentCount}). No notification sent.`);
-    }
+    console.log("No available submissions (itemCount = 0). No notification sent.");
     state.itemCount = currentCount;
     fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
   }

@@ -1,0 +1,68 @@
+name: SoundCampaign monitor
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: soundcampaign-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Restore browser session
+        env:
+          SOUND_CAMPAIGN_STORAGE_STATE: ${{ secrets.SOUND_CAMPAIGN_STORAGE_STATE }}
+        run: |
+          test -n "$SOUND_CAMPAIGN_STORAGE_STATE" || (echo "Missing SOUND_CAMPAIGN_STORAGE_STATE secret"; exit 1)
+          printf '%s' "$SOUND_CAMPAIGN_STORAGE_STATE" | base64 --decode > storage-state.json
+          chmod 600 storage-state.json
+
+      - name: Check Tracks Feed and notify
+        env:
+          SOUND_CAMPAIGN_URL: ${{ vars.SOUND_CAMPAIGN_URL }}
+          TRACK_CARD_SELECTOR: ${{ vars.TRACK_CARD_SELECTOR }}
+          TRACK_ID_SELECTOR: ${{ vars.TRACK_ID_SELECTOR }}
+          TRACK_TITLE_SELECTOR: ${{ vars.TRACK_TITLE_SELECTOR }}
+          TRACK_ARTIST_SELECTOR: ${{ vars.TRACK_ARTIST_SELECTOR }}
+          TRACK_LINK_SELECTOR: ${{ vars.TRACK_LINK_SELECTOR }}
+          TRACK_READY_SELECTOR: ${{ vars.TRACK_READY_SELECTOR }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          BASELINE_ONLY: ${{ vars.BASELINE_ONLY }}
+        run: node monitor.mjs
+
+      - name: Commit updated detection state
+        run: |
+          if git diff --quiet -- state/seen.json; then
+            echo "No state change."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state/seen.json
+          git commit -m "Update SoundCampaign detection state [skip ci]"
+          git push

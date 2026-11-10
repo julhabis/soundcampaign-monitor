@@ -1,0 +1,36 @@
+name: Test Pushover
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  send-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Envoyer une notification de test
+        shell: bash
+        env:
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$PUSHOVER_USER_KEY" || -z "$PUSHOVER_API_TOKEN" ]]; then
+            echo "::error::Un secret Pushover est manquant."
+            exit 1
+          fi
+
+          response=$(curl -sS --fail-with-body \
+            -X POST \
+            --data-urlencode "token=$PUSHOVER_API_TOKEN" \
+            --data-urlencode "user=$PUSHOVER_USER_KEY" \
+            --data-urlencode "title=SoundCampaign Monitor" \
+            --data-urlencode "message=Test réussi : Pushover est bien connecté à GitHub." \
+            https://api.pushover.net/1/messages.json)
+
+          echo "$response" | jq -e '.status == 1' >/dev/null
+
+          echo "OK : Pushover a accepté la notification de test."

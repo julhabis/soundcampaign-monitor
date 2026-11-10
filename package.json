@@ -1,0 +1,13 @@
+{
+  "name": "soundcampaign-tracks-monitor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "monitor": "node monitor.mjs",
+    "login": "node save-session.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.58.0"
+  }
+}

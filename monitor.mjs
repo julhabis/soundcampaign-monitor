@@ -1,115 +1,141 @@
 import fs from "node:fs";
-import crypto from "node:crypto";
 import { chromium } from "playwright";
 
-const required = ["PUSHOVER_USER_KEY", "PUSHOVER_API_TOKEN"];
+const required = [
+  "SOUND_CAMPAIGN_URL",
+  "PUSHOVER_USER_KEY",
+  "PUSHOVER_API_TOKEN",
+];
 for (const key of required) {
-  if (!process.env[key]) throw new Error(`Missing environment variable: ${key}`);
+  if (!process.env[key]) throw new Error(`Missing required GitHub variable/secret: ${key}`);
 }
 
-const url = process.env.SOUND_CAMPAIGN_URL || "https://app.soundcamps.com/";
+const feedUrl = process.env.SOUND_CAMPAIGN_URL;
 const statePath = "state/seen.json";
 const storagePath = "storage-state.json";
-const cardSelector = process.env.TRACK_CARD_SELECTOR;
-const idSelector = process.env.TRACK_ID_SELECTOR;
-const titleSelector = process.env.TRACK_TITLE_SELECTOR;
-const artistSelector = process.env.TRACK_ARTIST_SELECTOR;
-const linkSelector = process.env.TRACK_LINK_SELECTOR;
-const readySelector = process.env.TRACK_READY_SELECTOR;
+const endpointPath = "/curator/direct-matchings/available-reviews";
 
-if (!cardSelector) {
-  throw new Error("Set GitHub variable TRACK_CARD_SELECTOR to the CSS selector for one track card. See README.");
+if (!fs.existsSync(storagePath)) {
+  throw new Error("storage-state.json is missing; check the SOUND_CAMPAIGN_STORAGE_STATE GitHub secret.");
 }
-if (!fs.existsSync(storagePath)) throw new Error("storage-state.json is missing.");
 
+fs.mkdirSync("state", { recursive: true });
 const state = fs.existsSync(statePath)
   ? JSON.parse(fs.readFileSync(statePath, "utf8"))
-  : { seen: [], initialized: false };
+  : { initialized: false, itemCount: null };
 
 const browser = await chromium.launch({ headless: true });
 try {
   const context = await browser.newContext({ storageState: storagePath });
+
+  // The SoundCampaign page itself makes this request. We only observe its response.
+  // Remove conditional cache headers so the browser is less likely to receive a 304
+  // response without a JSON body.
+  await context.route(`**${endpointPath}**`, async (route) => {
+    const headers = { ...route.request().headers() };
+    delete headers["if-none-match"];
+    delete headers["if-modified-since"];
+    headers["cache-control"] = "no-cache, no-store";
+    headers["pragma"] = "no-cache";
+    await route.continue({ headers });
+  });
+
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
-  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
 
-  if (readySelector) await page.locator(readySelector).first().waitFor({ state: "visible", timeout: 15000 });
-  else await page.waitForTimeout(2500);
+  const responsePromise = page.waitForResponse(
+    (response) => {
+      try {
+        return new URL(response.url()).pathname === endpointPath;
+      } catch {
+        return false;
+      }
+    },
+    { timeout: 45000 }
+  );
 
-  // If redirected to login or challenged, fail without dumping page contents or secrets.
-  const current = page.url();
-  if (/login|sign-in|auth/i.test(current) && !/tracks|feed/i.test(current)) {
+  await page.goto(feedUrl, { waitUntil: "domcontentloaded", timeout: 45000 });
+
+  const currentUrl = page.url();
+  if (/login|sign-in|auth/i.test(currentUrl) && !/tracks|feed/i.test(currentUrl)) {
     throw new Error("SoundCampaign session appears expired; refresh the saved browser session.");
   }
 
-  const cards = await page.locator(cardSelector).evaluateAll((nodes, selectors) => {
-    const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
-    return nodes.map((node) => {
-      const pick = (selector) => selector ? node.querySelector(selector) : null;
-      const idNode = pick(selectors.id);
-      const titleNode = pick(selectors.title);
-      const artistNode = pick(selectors.artist);
-      const linkNode = pick(selectors.link);
-      const href = linkNode?.getAttribute("href") || "";
-      const title = clean(titleNode?.textContent);
-      const artist = clean(artistNode?.textContent);
-      const rawId = idNode?.getAttribute("data-id")
-        || idNode?.getAttribute("id")
-        || idNode?.textContent?.trim()
-        || href
-        || `${artist}|${title}`;
-      if (!title && !artist && !href && !rawId) return null;
-      const id = clean(rawId) || `${artist}|${title}|${href}`;
-      return { id, title, artist, href };
-    }).filter(Boolean);
-  }, { id: idSelector || null, title: titleSelector || null, artist: artistSelector || null, link: linkSelector || null });
-
-  const normalized = cards.map(c => ({
-    ...c,
-    href: c.href ? new URL(c.href, current).toString() : ""
-  }));
-  const unique = [...new Map(normalized.map(c => [c.id, c])).values()];
-
-  if (!state.initialized || process.env.BASELINE_ONLY === "true") {
-    state.seen = [...new Set([...state.seen, ...unique.map(c => c.id)])].slice(-5000);
-    state.initialized = true;
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
-    console.log(`Baseline saved: ${unique.length} visible cards. No notifications sent.`);
-  } else {
-    const old = new Set(state.seen);
-    const fresh = unique.filter(c => !old.has(c.id));
-    for (const track of fresh) {
-      const message = [
-        track.artist && track.title ? `${track.artist} — ${track.title}` : (track.title || track.artist || "Nouvelle soumission"),
-        track.href || ""
-      ].filter(Boolean).join("\n");
-      const body = new URLSearchParams({
-        token: process.env.PUSHOVER_API_TOKEN,
-        user: process.env.PUSHOVER_USER_KEY,
-        title: "Nouvelle soumission SoundCampaign",
-        message: message.slice(0, 1024),
-        priority: "0"
-      });
-      const response = await fetch("https://api.pushover.net/1/messages.json", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body
-      });
-      if (!response.ok) {
-        const status = response.status;
-        throw new Error(`Pushover notification failed (HTTP ${status}).`);
-      }
-      console.log(`Pushover notification sent for detected item ${hashForLog(track.id)}.`);
-    }
-    state.seen = [...new Set([...state.seen, ...unique.map(c => c.id)])].slice(-5000);
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
-    console.log(`Visible cards: ${unique.length}; new cards: ${fresh.length}.`);
+  const response = await responsePromise;
+  if (response.status() === 304) {
+    throw new Error("SoundCampaign returned HTTP 304 without a response body. Retry after refreshing the page/session.");
   }
+  if (!response.ok()) {
+    throw new Error(`SoundCampaign available-reviews request failed (HTTP ${response.status()}).`);
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error("The available-reviews response was not valid JSON.");
+  }
+
+  const rawCount = payload?.meta?.itemCount;
+  const fallbackCount = payload?.data?.reviews;
+  let currentCount;
+  if (rawCount !== undefined && rawCount !== null && Number.isFinite(Number(rawCount))) {
+    currentCount = Number(rawCount);
+  } else if (Array.isArray(fallbackCount)) {
+    currentCount = fallbackCount.length;
+  } else {
+    throw new Error("The available-reviews JSON did not contain meta.itemCount or data.reviews.");
+  }
+
+  const baselineOnly = process.env.BASELINE_ONLY === "true";
+  const previousCount = Number(state.itemCount);
+
+  if (!state.initialized || baselineOnly || !Number.isFinite(previousCount)) {
+    state.initialized = true;
+    state.itemCount = currentCount;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+    console.log(`Baseline saved: ${currentCount} available submission(s). No notification sent.`);
+  } else if (currentCount > previousCount) {
+    const increase = currentCount - previousCount;
+    const body = new URLSearchParams({
+      token: process.env.PUSHOVER_API_TOKEN,
+      user: process.env.PUSHOVER_USER_KEY,
+      title: "Nouvelle soumission SoundCampaign",
+      message: increase === 1
+        ? "Une nouvelle soumission est disponible dans ton Tracks Feed SoundCampaign."
+        : `${increase} nouvelles soumissions sont disponibles dans ton Tracks Feed SoundCampaign.`,
+      priority: "0",
+    });
+
+    const pushoverResponse = await fetch("https://api.pushover.net/1/messages.json", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    let pushoverResult;
+    try {
+      pushoverResult = await pushoverResponse.json();
+    } catch {
+      throw new Error(`Pushover returned an unreadable response (HTTP ${pushoverResponse.status}).`);
+    }
+    if (!pushoverResponse.ok || pushoverResult?.status !== 1) {
+      throw new Error(`Pushover rejected the notification (HTTP ${pushoverResponse.status}).`);
+    }
+
+    console.log(`Notification accepted by Pushover. Available submissions increased from ${previousCount} to ${currentCount}.`);
+    state.itemCount = currentCount;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+  } else {
+    if (currentCount < previousCount) {
+      console.log(`Available submissions decreased from ${previousCount} to ${currentCount}; baseline updated without notification.`);
+    } else {
+      console.log(`No increase in available submissions (${currentCount}). No notification sent.`);
+    }
+    state.itemCount = currentCount;
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+  }
+
   await context.close();
 } finally {
   await browser.close();
-}
-
-function hashForLog(value) {
-  return crypto.createHash("sha256").update(value).digest("hex").slice(0, 10);
 }

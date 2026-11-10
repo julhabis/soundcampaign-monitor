@@ -1,96 +1,42 @@
-# SoundCampaign Tracks Feed → Pushover (prototype Playwright)
+# SoundCampaign Monitor — Option 2 (lecture de la réponse JSON du navigateur)
 
-Ce dépôt contrôle **l'interface web** de SoundCampaign avec Playwright/Chromium (pas d'appel direct à l'API SoundCampaign), puis notifie Pushover lorsqu'une carte nouvelle apparaît.
+Cette version utilise Playwright pour ouvrir la page Tracks Feed. Elle observe la requête `available-reviews` que la page SoundCampaign déclenche elle-même, puis lit `meta.itemCount` dans sa réponse JSON. Elle n'utilise aucun sélecteur CSS `TRACK_*` et n'effectue pas de requête API SoundCampaign séparée depuis le script.
 
-> **Important :** vérifie auprès de SoundCampaign que l'automatisation de navigation/lecture est autorisée. Le fait de passer par le navigateur ne garantit pas que cette automatisation soit permise. Respecte leurs conditions et arrête en cas de CAPTCHA, blocage, HTTP 429 ou avertissement. Ce projet ne contourne pas les protections anti-bot et n'automatise aucune review/acceptation.
+## Fichiers à remplacer dans le dépôt
 
-## Ce qui est prêt / ce qui reste à configurer
+- `monitor.mjs`
+- `.github/workflows/monitor.yml`
+- `state/seen.json`
 
-Le workflow GitHub Actions est programmé toutes les 5 minutes. Le code est un squelette fonctionnel, mais les sélecteurs CSS des cartes et des champs doivent être relevés dans l'interface réelle : la capture Network seule ne les révèle pas. Aucun sélecteur SoundCampaign n'est inventé.
+Garder les autres fichiers existants, notamment `package.json` et `save-session.mjs`.
 
-## 1. Créer le dépôt public
+## Configuration GitHub
 
-1. Crée un dépôt GitHub **public** vide.
-2. Ajoute les fichiers de ce dossier (ou pousse-les avec Git).
-3. Dans `Settings → Actions → General`, autorise les workflows et les permissions d'écriture si nécessaire.
-4. Le workflow a `contents: write` pour sauvegarder `state/seen.json` après détection.
+Secrets (Settings → Secrets and variables → Actions → Secrets) :
 
-Le code sera public. Les secrets GitHub restent masqués, mais les journaux ne doivent jamais afficher les valeurs secrètes.
+- `SOUND_CAMPAIGN_STORAGE_STATE` : stockage de session exporté et encodé en base64
+- `PUSHOVER_USER_KEY`
+- `PUSHOVER_API_TOKEN`
 
-## 2. Préparer une session navigateur (sur ton ordinateur, une seule fois)
+Variables (Settings → Secrets and variables → Actions → Variables) :
 
-Prérequis : Node.js 20+.
+- `SOUND_CAMPAIGN_URL` : URL de la page Tracks Feed dans le navigateur, pas l'URL de l'API
+- `BASELINE_ONLY` : `true` pour le premier lancement de référence, puis `false`
 
-```bash
-npm install
-npx playwright install chromium
-npm run login
-```
+Aucune variable `TRACK_CARD_SELECTOR`, `TRACK_ID_SELECTOR`, `TRACK_TITLE_SELECTOR`, `TRACK_ARTIST_SELECTOR`, `TRACK_LINK_SELECTOR` ou `TRACK_READY_SELECTOR` n'est nécessaire.
 
-Un navigateur s'ouvre. Connecte-toi manuellement à SoundCampaign et ouvre Tracks Feed, puis reviens au terminal et appuie sur Entrée. Cela crée `storage-state.json`.
+## Premier lancement
 
-**Ne committe jamais `storage-state.json`, ne le joins pas à une conversation et ne le publie pas.** Il contient des cookies et peut permettre l'accès au compte. S'il est exposé, révoque la session.
+1. Remplacer les trois fichiers ci-dessus et committer.
+2. Vérifier que les quatre secrets/variables ci-dessus sont correctement configurés.
+3. Laisser `BASELINE_ONLY=true` et lancer Actions → SoundCampaign Monitor → Run workflow. Cette exécution enregistre le nombre initial de soumissions sans notification.
+4. Après le succès, régler `BASELINE_ONLY=false` dans les variables GitHub.
+5. Les exécutions ultérieures envoient une notification Pushover uniquement lorsque `meta.itemCount` augmente.
 
-Encode-le en base64 :
+## Limite importante
 
-macOS / Linux :
-```bash
-base64 < storage-state.json | tr -d '\n'
-```
+La détection repose sur le nombre total `meta.itemCount`, pas sur des identifiants individuels. Si une soumission disparaît au même moment qu'une autre arrive, le nombre peut rester identique et cette arrivée pourrait ne pas être signalée. Ce choix évite d'enregistrer ou d'afficher les détails des morceaux.
 
-Dans GitHub → `Settings → Secrets and variables → Actions → New repository secret`, crée :
-- `SOUND_CAMPAIGN_STORAGE_STATE` = la chaîne base64 ci-dessus
-- `PUSHOVER_USER_KEY` = User Key Pushover
-- `PUSHOVER_API_TOKEN` = token de ton application Pushover
+Le cron `*/5 * * * *` demande une exécution toutes les cinq minutes, mais GitHub Actions peut retarder les lancements. Vérifier que l'automatisation de navigation/lecture est autorisée par SoundCampaign et ne pas contourner les CAPTCHA, restrictions ou limites du service.
 
-Le fichier local peut ensuite être supprimé de ton ordinateur si tu le souhaites.
-
-## 3. Configurer les variables GitHub
-
-Dans `Settings → Secrets and variables → Actions → Variables`, ajoute :
-
-- `SOUND_CAMPAIGN_URL` : URL exacte de Tracks Feed (à récupérer dans la barre d'adresse du navigateur).
-- `TRACK_CARD_SELECTOR` : sélecteur CSS d'une carte de morceau (obligatoire).
-- `TRACK_ID_SELECTOR` : (facultatif) élément enfant contenant un identifiant stable, ou un élément ayant `data-id` / `id`.
-- `TRACK_TITLE_SELECTOR` : (facultatif) élément enfant contenant le titre.
-- `TRACK_ARTIST_SELECTOR` : (facultatif) élément enfant contenant l'artiste.
-- `TRACK_LINK_SELECTOR` : (facultatif) élément enfant `<a>` vers le morceau.
-- `TRACK_READY_SELECTOR` : (facultatif) sélecteur qui devient visible quand le feed est chargé.
-- `BASELINE_ONLY` : `true` au premier lancement, puis supprime la variable ou remplace-la par `false`.
-
-Pour trouver les sélecteurs : dans Chrome, ouvre Tracks Feed, clic droit sur une carte → Inspecter. Repère l'élément HTML qui englobe une carte entière, puis les éléments du titre/artiste/lien. Les sélecteurs doivent être CSS et relatifs à la carte pour les champs enfants.
-
-## 4. Premier lancement
-
-1. Mets `BASELINE_ONLY=true`.
-2. Lance `Actions → SoundCampaign monitor → Run workflow`.
-3. Vérifie les logs : le script doit indiquer `Baseline saved`.
-4. Mets ensuite `BASELINE_ONLY=false` (ou supprime la variable).
-5. Les exécutions suivantes notifient les nouvelles cartes.
-
-La première exécution établit une référence et **n'envoie pas de notification** pour les morceaux déjà présents.
-
-## 5. Fonctionnement et limites
-
-- Cron `*/5 * * * *` : GitHub peut retarder les exécutions ; ce n'est pas une garantie d'exécution à la minute exacte.
-- Le workflow est séquentiel (`concurrency`) pour éviter deux mises à jour d'état simultanées.
-- Le dépôt conserve les identifiants détectés dans `state/seen.json` via un commit automatique.
-- Le script ne clique pas sur les boutons d'acceptation/review et ne modifie aucune soumission.
-- Si la session expire, relance `npm run login`, recrée le secret `SOUND_CAMPAIGN_STORAGE_STATE`, puis relance le workflow.
-- Pushover est appelé uniquement lorsqu'un nouvel élément est détecté.
-- GitHub Actions ne doit pas être utilisé pour contourner CAPTCHA, restrictions d'accès ou limites imposées par SoundCampaign.
-
-## Dépannage
-
-- `Missing environment variable` : secret ou variable manquant.
-- `TRACK_CARD_SELECTOR` absent : configure le sélecteur CSS de carte.
-- `SoundCampaign session appears expired` : renouvelle la session manuellement.
-- `strict`/`timeout` Playwright : vérifie les sélecteurs et que Tracks Feed est chargé.
-- Aucun résultat : la page peut avoir une liste vide, un sélecteur incorrect, ou des cartes rendues différemment. N'élargis pas les sélecteurs au hasard ; inspecte le DOM.
-
-## Fichiers
-
-- `.github/workflows/monitor.yml` : planification et exécution cloud.
-- `monitor.mjs` : lecture du DOM, comparaison, notification.
-- `save-session.mjs` : connexion manuelle initiale et sauvegarde de session.
-- `state/seen.json` : créé/actualisé par le workflow.
+Ne jamais committer `storage-state.json` ni partager sa valeur : il contient des données de session.

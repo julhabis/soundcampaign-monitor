@@ -62,7 +62,14 @@ try {
   const responsePromise = page.waitForResponse(
     (response) => {
       try {
-        return new URL(response.url()).pathname === endpointPath;
+        const url = new URL(response.url());
+  
+        return (
+          url.pathname === endpointPath &&
+          url.searchParams.get("filter") === "without_past_matches" &&
+          url.searchParams.getAll("sortBy[]").includes("startDate.ASC") &&
+          url.searchParams.get("hideAiGenerated") === "false"
+        );
       } catch {
         return false;
       }

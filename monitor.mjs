@@ -17,7 +17,9 @@ for (const key of required) {
 const feedUrl = process.env.SOUND_CAMPAIGN_URL;
 const statePath = "state/seen.json";
 const storagePath = "storage-state.json";
-const endpointPath = "/curator/direct-matchings/available-reviews";
+
+// Correct SoundCampaign endpoint for available submissions.
+const endpointPath = "/curator/reviews/available";
 
 if (!fs.existsSync(storagePath)) {
   throw new Error(
@@ -85,6 +87,8 @@ try {
 
   const response = await responsePromise;
 
+  // Log the exact API URL to confirm that the correct endpoint is used.
+  console.log(`Observed API URL: ${response.url()}`);
   console.log(`SoundCampaign response received: HTTP ${response.status()}`);
 
   if (response.status() === 304) {
@@ -108,6 +112,16 @@ try {
       "The available-reviews response was not valid JSON."
     );
   }
+
+  // Log the relevant API fields for easier diagnosis.
+  console.log(
+    "SoundCampaign API diagnostic:",
+    JSON.stringify({
+      itemCount: payload?.meta?.itemCount,
+      reviewsOnPage: payload?.data?.reviews?.length,
+      isLimitReached: payload?.data?.isLimitReached,
+    })
+  );
 
   const rawCount = payload?.meta?.itemCount;
   const fallbackCount = payload?.data?.reviews;

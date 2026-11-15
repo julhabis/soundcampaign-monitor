@@ -18,7 +18,8 @@ const feedUrl = process.env.SOUND_CAMPAIGN_URL;
 const statePath = "state/seen.json";
 const storagePath = "storage-state.json";
 
-// Correct SoundCampaign endpoint for available submissions.
+// Confirmed SoundCampaign API endpoint.
+const endpointHost = "prod-nest.soundcam.co";
 const endpointPath = "/curator/reviews/available";
 
 if (!fs.existsSync(storagePath)) {
@@ -40,8 +41,7 @@ try {
     storageState: storagePath,
   });
 
-  // Observe the request made by the SoundCampaign page.
-  // Remove conditional cache headers to avoid 304 responses without a JSON body.
+  // Remove conditional cache headers to avoid 304 responses.
   await context.route(`**${endpointPath}**`, async (route) => {
     const headers = { ...route.request().headers() };
 
@@ -57,24 +57,104 @@ try {
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
 
+  // Verify that a URL belongs to the expected API endpoint.
+  function isAvailableReviewsEndpoint(rawUrl) {
+    try {
+      const url = new URL(rawUrl);
+
+      return (
+        url.hostname === endpointHost &&
+        url.pathname.replace(/\/+$/, "") === endpointPath
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  // Verify the exact API filters used by the Tracks Feed.
+  function isExpectedAvailableReviews(response) {
+    try {
+      const url = new URL(response.url());
+
+      return (
+        isAvailableReviewsEndpoint(response.url()) &&
+        url.searchParams.get("filter") === "without_past_matches" &&
+        url.searchParams.getAll("sortBy[]").includes("startDate.ASC") &&
+        url.searchParams.get("hideAiGenerated") === "false"
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  // Store network diagnostics for timeout investigation.
+  const observedTraffic = [];
+
+  // Log API requests.
+  context.on("request", (request) => {
+    if (!isAvailableReviewsEndpoint(request.url())) return;
+
+    const info = {
+      type: "REQUEST",
+      method: request.method(),
+      url: request.url(),
+    };
+
+    observedTraffic.push(info);
+
+    console.log(
+      "[SoundCampaign API]",
+      JSON.stringify(info)
+    );
+  });
+
+  // Log API responses.
+  context.on("response", (response) => {
+    if (!isAvailableReviewsEndpoint(response.url())) return;
+
+    const info = {
+      type: "RESPONSE",
+      status: response.status(),
+      url: response.url(),
+    };
+
+    observedTraffic.push(info);
+
+    console.log(
+      "[SoundCampaign API]",
+      JSON.stringify(info)
+    );
+  });
+
+  // Detect network failures.
+  context.on("requestfailed", (request) => {
+    if (!isAvailableReviewsEndpoint(request.url())) return;
+
+    const info = {
+      type: "REQUEST FAILED",
+      error: request.failure()?.errorText,
+      url: request.url(),
+    };
+
+    observedTraffic.push(info);
+
+    console.error(
+      "[SoundCampaign API]",
+      JSON.stringify(info)
+    );
+  });
+
   console.log("Opening SoundCampaign Tracks Feed...");
 
-  const responsePromise = page.waitForResponse(
-    (response) => {
-      try {
-        const url = new URL(response.url());
-  
-        return (
-          url.pathname === endpointPath &&
-          url.searchParams.get("filter") === "without_past_matches" &&
-          url.searchParams.getAll("sortBy[]").includes("startDate.ASC") &&
-          url.searchParams.get("hideAiGenerated") === "false"
-        );
-      } catch {
-        return false;
-      }
-    },
-    { timeout: 45000 }
+  // Start listening before navigation to avoid missing the API response.
+  // Convert rejection into a result so navigation errors cannot cause
+  // an unhandled promise rejection.
+  const responsePromise = context.waitForEvent("response", {
+    predicate: isExpectedAvailableReviews,
+    timeout: 45000,
+  }).then(
+    (response) => ({ response }),
+    (error) => ({ error })
   );
 
   await page.goto(feedUrl, {
@@ -92,11 +172,65 @@ try {
 
   console.log("Waiting for available-reviews response...");
 
-  const response = await responsePromise;
+  const result = await responsePromise;
 
-  // Log the exact API URL to confirm that the correct endpoint is used.
+  if (result.error) {
+    console.error(
+      "SoundCampaign API traffic observed:",
+      JSON.stringify(observedTraffic, null, 2)
+    );
+
+    const requestObserved = observedTraffic.some(
+      (entry) => entry.type === "REQUEST"
+    );
+
+    if (!requestObserved) {
+      throw new Error(
+        "No SoundCampaign available-reviews API request was observed. " +
+        "The page may not have triggered the API call.",
+        { cause: result.error }
+      );
+    }
+
+    throw new Error(
+      "SoundCampaign API request was observed, but no response matched " +
+      "the expected endpoint and filters.",
+      { cause: result.error }
+    );
+  }
+
+  const response = result.response;
+
+  // Log the exact API URL and its parameters.
   console.log(`Observed API URL: ${response.url()}`);
-  console.log(`SoundCampaign response received: HTTP ${response.status()}`);
+
+  const observedUrl = new URL(response.url());
+
+  console.log(
+    "Observed API parameters:",
+    JSON.stringify({
+      filter: observedUrl.searchParams.get("filter"),
+      sortBy: observedUrl.searchParams.getAll("sortBy[]"),
+      hideAiGenerated: observedUrl.searchParams.get("hideAiGenerated"),
+      pageNumber: observedUrl.searchParams.get("pageNumber"),
+      pageSize: observedUrl.searchParams.get("pageSize"),
+    })
+  );
+
+  console.log(
+    `SoundCampaign response received: HTTP ${response.status()}`
+  );
+
+  // Additional safety check.
+  if (
+    observedUrl.searchParams.get("filter") !== "without_past_matches" ||
+    !observedUrl.searchParams.getAll("sortBy[]").includes("startDate.ASC") ||
+    observedUrl.searchParams.get("hideAiGenerated") !== "false"
+  ) {
+    throw new Error(
+      "SoundCampaign API parameters have changed unexpectedly."
+    );
+  }
 
   if (response.status() === 304) {
     throw new Error(
@@ -120,7 +254,7 @@ try {
     );
   }
 
-  // Log the relevant API fields for easier diagnosis.
+  // Log relevant API fields.
   console.log(
     "SoundCampaign API diagnostic:",
     JSON.stringify({
@@ -151,7 +285,7 @@ try {
 
   console.log(`Available submissions detected: ${currentCount}`);
 
-  // Update state for diagnostic purposes.
+  // Update detection state.
   state.initialized = true;
   state.itemCount = currentCount;
 
@@ -200,7 +334,10 @@ try {
     }
 
     if (!pushoverResponse.ok || pushoverResult?.status !== 1) {
-      console.error("Pushover response:", JSON.stringify(pushoverResult));
+      console.error(
+        "Pushover response:",
+        JSON.stringify(pushoverResult)
+      );
 
       throw new Error(
         `Pushover rejected the notification (HTTP ${pushoverResponse.status()}).`
@@ -211,9 +348,12 @@ try {
       `SUCCESS: Pushover accepted the notification. ${currentCount} submission(s) available.`
     );
   } else {
-    console.log("No available submissions (itemCount = 0). No notification sent.");
+    console.log(
+      "No available submissions (itemCount = 0). No notification sent."
+    );
   }
 
+  // Save state only after successful detection and notification handling.
   fs.writeFileSync(
     statePath,
     JSON.stringify(state, null, 2) + "\n"

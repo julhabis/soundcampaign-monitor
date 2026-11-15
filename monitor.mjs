@@ -41,7 +41,7 @@ try {
     storageState: storagePath,
   });
 
-  // Remove conditional cache headers to avoid 304 responses.
+  // Avoid conditional cache responses such as HTTP 304.
   await context.route(`**${endpointPath}**`, async (route) => {
     const headers = { ...route.request().headers() };
 
@@ -57,7 +57,7 @@ try {
   const page = await context.newPage();
   page.setDefaultTimeout(20000);
 
-  // Verify that a URL belongs to the expected API endpoint.
+  // Check whether a URL belongs to the expected API endpoint.
   function isAvailableReviewsEndpoint(rawUrl) {
     try {
       const url = new URL(rawUrl);
@@ -71,7 +71,7 @@ try {
     }
   }
 
-  // Verify the exact API filters used by the Tracks Feed.
+  // Check the expected API filters.
   function isExpectedAvailableReviews(response) {
     try {
       const url = new URL(response.url());
@@ -87,7 +87,7 @@ try {
     }
   }
 
-  // Store network diagnostics for timeout investigation.
+  // Store network diagnostics.
   const observedTraffic = [];
 
   // Log API requests.
@@ -101,11 +101,7 @@ try {
     };
 
     observedTraffic.push(info);
-
-    console.log(
-      "[SoundCampaign API]",
-      JSON.stringify(info)
-    );
+    console.log("[SoundCampaign API]", JSON.stringify(info));
   });
 
   // Log API responses.
@@ -119,11 +115,7 @@ try {
     };
 
     observedTraffic.push(info);
-
-    console.log(
-      "[SoundCampaign API]",
-      JSON.stringify(info)
-    );
+    console.log("[SoundCampaign API]", JSON.stringify(info));
   });
 
   // Detect network failures.
@@ -137,18 +129,12 @@ try {
     };
 
     observedTraffic.push(info);
-
-    console.error(
-      "[SoundCampaign API]",
-      JSON.stringify(info)
-    );
+    console.error("[SoundCampaign API]", JSON.stringify(info));
   });
 
   console.log("Opening SoundCampaign Tracks Feed...");
 
-  // Start listening before navigation to avoid missing the API response.
-  // Convert rejection into a result so navigation errors cannot cause
-  // an unhandled promise rejection.
+  // Start listening before navigation.
   const responsePromise = context.waitForEvent("response", {
     predicate: isExpectedAvailableReviews,
     timeout: 45000,
@@ -162,11 +148,74 @@ try {
     timeout: 45000,
   });
 
-  const currentUrl = page.url();
+  // Give the application time to render.
+  await page.waitForTimeout(2000);
 
-  if (/login|sign-in|auth/i.test(currentUrl) && !/tracks|feed/i.test(currentUrl)) {
+  // Diagnose the actual page displayed by SoundCampaign.
+  const pageDiagnostics = await page.evaluate(() => {
+    const body = document.body?.innerText || "";
+    const normalized = body.toLowerCase();
+
+    const hasPasswordField = Boolean(
+      document.querySelector(
+        'input[type="password"], input[autocomplete="current-password"]'
+      )
+    );
+
+    const hasEmailField = Boolean(
+      document.querySelector(
+        'input[type="email"], input[autocomplete="username"], ' +
+        'input[autocomplete="email"], input[name*="email" i], ' +
+        'input[name*="username" i]'
+      )
+    );
+
+    const loginText =
+      /log in|login|sign in|connexion|se connecter|session expired|session has expired/i.test(
+        normalized
+      );
+
+    const loginButton = Array.from(
+      document.querySelectorAll("button, a, [role='button']")
+    ).some((element) =>
+      /log in|login|sign in|connexion|se connecter/i.test(
+        element.innerText || element.getAttribute("aria-label") || ""
+      )
+    );
+
+    return {
+      url: location.href,
+      title: document.title,
+      hasPasswordField,
+      hasEmailField,
+      loginText,
+      loginButton,
+      bodyPreview: body.slice(0, 400),
+    };
+  });
+
+  console.log(
+    "SoundCampaign page diagnostics:",
+    JSON.stringify(pageDiagnostics, null, 2)
+  );
+
+  // Detect a login redirect or a login form.
+  const loginUrl =
+    /login|log-in|sign-in|signin|auth|session/i.test(page.url());
+
+  const loginDetected =
+    pageDiagnostics.hasPasswordField &&
+    (
+      pageDiagnostics.hasEmailField ||
+      pageDiagnostics.loginText ||
+      pageDiagnostics.loginButton
+    );
+
+  if (loginUrl || loginDetected) {
     throw new Error(
-      "SoundCampaign session appears expired; refresh the saved browser session."
+      "SoundCampaign login page detected. " +
+      "The saved browser session may have expired. " +
+      "Refresh storage-state.json."
     );
   }
 
@@ -201,7 +250,6 @@ try {
 
   const response = result.response;
 
-  // Log the exact API URL and its parameters.
   console.log(`Observed API URL: ${response.url()}`);
 
   const observedUrl = new URL(response.url());
@@ -221,7 +269,7 @@ try {
     `SoundCampaign response received: HTTP ${response.status()}`
   );
 
-  // Additional safety check.
+  // Validate the expected API parameters.
   if (
     observedUrl.searchParams.get("filter") !== "without_past_matches" ||
     !observedUrl.searchParams.getAll("sortBy[]").includes("startDate.ASC") ||
@@ -285,7 +333,7 @@ try {
 
   console.log(`Available submissions detected: ${currentCount}`);
 
-  // Update detection state.
+  // Update state only after successful API detection.
   state.initialized = true;
   state.itemCount = currentCount;
 
@@ -353,7 +401,7 @@ try {
     );
   }
 
-  // Save state only after successful detection and notification handling.
+  // Save state after successful detection and notification handling.
   fs.writeFileSync(
     statePath,
     JSON.stringify(state, null, 2) + "\n"

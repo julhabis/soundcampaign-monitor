@@ -1,5 +1,7 @@
 
 import fs from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+import sodium from "libsodium-wrappers";
 import { chromium } from "playwright";
 
 const required = [
@@ -28,11 +30,137 @@ if (!fs.existsSync(storagePath)) {
   );
 }
 
+// Keep the original snapshot so we only rewrite the GitHub secret when
+// cookies, localStorage, or IndexedDB have actually changed.
+let initialStorageState;
+
+try {
+  initialStorageState = JSON.parse(fs.readFileSync(storagePath, "utf8"));
+} catch {
+  throw new Error("storage-state.json is not valid JSON.");
+}
+
 fs.mkdirSync("state", { recursive: true });
 
 const state = fs.existsSync(statePath)
   ? JSON.parse(fs.readFileSync(statePath, "utf8"))
   : { initialized: false, itemCount: null };
+
+async function updateGitHubSessionSecret(storageStateBase64) {
+  const token = process.env.SESSION_SYNC_TOKEN;
+  const repository = process.env.GITHUB_REPOSITORY;
+  const apiBase = (process.env.GITHUB_API_URL || "https://api.github.com")
+    .replace(/\/+$/, "");
+
+  if (!token) {
+    throw new Error("Missing SESSION_SYNC_TOKEN repository secret.");
+  }
+
+  if (!repository || !repository.includes("/")) {
+    throw new Error("GITHUB_REPOSITORY is missing or invalid.");
+  }
+
+  const [owner, repo] = repository.split("/");
+  if (!owner || !repo) {
+    throw new Error("GITHUB_REPOSITORY must have the format owner/repository.");
+  }
+
+  if (Buffer.byteLength(storageStateBase64, "utf8") > 48 * 1024) {
+    throw new Error(
+      "The refreshed browser state exceeds GitHub's 48 KB repository-secret limit."
+    );
+  }
+
+  const headers = {
+    Accept: "application/vnd.github+json",
+    Authorization: `Bearer ${token}`,
+    "X-GitHub-Api-Version": "2026-03-10",
+    "User-Agent": "soundcampaign-monitor",
+  };
+
+  const publicKeyUrl =
+    `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+    "/actions/secrets/public-key";
+
+  const publicKeyResponse = await fetch(publicKeyUrl, {
+    method: "GET",
+    headers,
+    signal: AbortSignal.timeout(15000),
+  });
+
+  const publicKeyText = await publicKeyResponse.text();
+  let publicKeyData;
+
+  try {
+    publicKeyData = JSON.parse(publicKeyText);
+  } catch {
+    throw new Error(
+      `GitHub public-key endpoint returned invalid JSON (HTTP ${publicKeyResponse.status}).`
+    );
+  }
+
+  if (!publicKeyResponse.ok) {
+    throw new Error(
+      `Cannot read GitHub repository public key (HTTP ${publicKeyResponse.status}): ` +
+      `${publicKeyData?.message || "unknown API error"}`
+    );
+  }
+
+  if (!publicKeyData?.key || !publicKeyData?.key_id) {
+    throw new Error("GitHub did not return the repository public key and key_id.");
+  }
+
+  await sodium.ready;
+
+  const publicKeyBytes = sodium.from_base64(
+    publicKeyData.key,
+    sodium.base64_variants.ORIGINAL
+  );
+
+  const encryptedBytes = sodium.crypto_box_seal(
+    sodium.from_string(storageStateBase64),
+    publicKeyBytes
+  );
+
+  const encryptedValue = sodium.to_base64(
+    encryptedBytes,
+    sodium.base64_variants.ORIGINAL
+  );
+
+  const secretName = "SOUND_CAMPAIGN_STORAGE_STATE";
+  const updateUrl =
+    `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}` +
+    `/actions/secrets/${encodeURIComponent(secretName)}`;
+
+  const updateResponse = await fetch(updateUrl, {
+    method: "PUT",
+    headers: {
+      ...headers,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      encrypted_value: encryptedValue,
+      key_id: publicKeyData.key_id,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!updateResponse.ok) {
+    const errorText = await updateResponse.text();
+    let errorMessage = errorText;
+
+    try {
+      errorMessage = JSON.parse(errorText)?.message || errorText;
+    } catch {
+      // Keep the plain response text for diagnostics.
+    }
+
+    throw new Error(
+      `GitHub could not update ${secretName} (HTTP ${updateResponse.status}): ` +
+      `${String(errorMessage).slice(0, 300)}`
+    );
+  }
+}
 
 const browser = await chromium.launch({ headless: true });
 
@@ -332,6 +460,46 @@ try {
   }
 
   console.log(`Available submissions detected: ${currentCount}`);
+
+  // Capture refreshed browser credentials only after the authenticated API
+  // response and JSON payload have been validated.
+  try {
+    // Allow any response handlers or token-refresh logic to finish.
+    await page.waitForTimeout(500);
+
+    const refreshedStorageState = await context.storageState({
+      indexedDB: true,
+    });
+
+    if (!isDeepStrictEqual(initialStorageState, refreshedStorageState)) {
+      const refreshedStorageStateJson = JSON.stringify(
+        refreshedStorageState
+      );
+
+      // The workflow base64-decodes this secret before restoring the file,
+      // so preserve that exact secret format when writing the refreshed state.
+      const refreshedStorageStateBase64 = Buffer.from(
+        refreshedStorageStateJson,
+        "utf8"
+      ).toString("base64");
+
+      await updateGitHubSessionSecret(refreshedStorageStateBase64);
+
+      console.log(
+        "SoundCampaign browser state changed and was securely synchronized to GitHub."
+      );
+    } else {
+      console.log(
+        "SoundCampaign browser state is unchanged; GitHub secret was not rewritten."
+      );
+    }
+  } catch (error) {
+    // A failed session sync must not suppress a valid Pushover alert or
+    // turn a successful availability check into a false negative.
+    console.log(
+      `::warning::Automatic SoundCampaign session sync failed: ${error.message}`
+    );
+  }
 
   // Update state only after successful API detection.
   state.initialized = true;

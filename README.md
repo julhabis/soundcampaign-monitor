@@ -1,42 +1,102 @@
-# SoundCampaign Monitor — Option 2 (lecture de la réponse JSON du navigateur)
+# SoundCampaign Monitor
 
-Cette version utilise Playwright pour ouvrir la page Tracks Feed. Elle observe la requête `available-reviews` que la page SoundCampaign déclenche elle-même, puis lit `meta.itemCount` dans sa réponse JSON. Elle n'utilise aucun sélecteur CSS `TRACK_*` et n'effectue pas de requête API SoundCampaign séparée depuis le script.
+Ce dépôt surveille le Tracks Feed SoundCampaign avec Playwright, lit la réponse JSON de l'endpoint utilisé par la page (`/curator/reviews/available`) et envoie une notification Pushover lorsque des soumissions sont disponibles.
 
-## Fichiers à remplacer dans le dépôt
+Le workflow GitHub Actions se déclenche selon le cron défini dans `.github/workflows/monitor.yml` (environ toutes les cinq minutes). Chaque exécution utilise un runner temporaire : le fichier de session local est donc restauré depuis un secret GitHub au début de chaque exécution.
 
-- `monitor.mjs`
-- `.github/workflows/monitor.yml`
-- `state/seen.json`
+## Arborescence
 
-Garder les autres fichiers existants, notamment `package.json` et `save-session.mjs`.
+```text
+soundcampaign-monitor/
+├── .github/
+│   └── workflows/
+│       ├── monitor.yml
+│       └── test-pushover.yml
+├── state/
+│   └── seen.json
+├── .gitignore
+├── monitor.mjs
+├── package.json
+├── README.md
+└── save-session.mjs
+```
 
 ## Configuration GitHub
 
-Secrets (Settings → Secrets and variables → Actions → Secrets) :
+Dans **Settings → Secrets and variables → Actions → Secrets**, configurer :
 
-- `SOUND_CAMPAIGN_STORAGE_STATE` : stockage de session exporté et encodé en base64
-- `PUSHOVER_USER_KEY`
-- `PUSHOVER_API_TOKEN`
+- `SOUND_CAMPAIGN_STORAGE_STATE` : contenu Base64 du fichier local `storage-state.json` ;
+- `PUSHOVER_USER_KEY` ;
+- `PUSHOVER_API_TOKEN` ;
+- `SESSION_SYNC_TOKEN` : facultatif pour l'exécution du monitoring, mais nécessaire à la mise à jour automatique du secret de session.
 
-Variables (Settings → Secrets and variables → Actions → Variables) :
+Dans **Settings → Secrets and variables → Actions → Variables**, configurer :
 
-- `SOUND_CAMPAIGN_URL` : URL de la page Tracks Feed dans le navigateur, pas l'URL de l'API
-- `BASELINE_ONLY` : `true` pour le premier lancement de référence, puis `false`
+- `SOUND_CAMPAIGN_URL` : URL de la page Tracks Feed dans le navigateur, et non l'URL de l'API.
 
-Aucune variable `TRACK_CARD_SELECTOR`, `TRACK_ID_SELECTOR`, `TRACK_TITLE_SELECTOR`, `TRACK_ARTIST_SELECTOR`, `TRACK_LINK_SELECTOR` ou `TRACK_READY_SELECTOR` n'est nécessaire.
+### Autorisations de SESSION_SYNC_TOKEN
 
-## Premier lancement
+Créer un token personnel GitHub **fine-grained**, limité au seul dépôt `soundcampaign-monitor`, avec la permission du dépôt **Secrets : Read and write**. Enregistrer sa valeur dans le secret `SESSION_SYNC_TOKEN`.
 
-1. Remplacer les trois fichiers ci-dessus et committer.
-2. Vérifier que les quatre secrets/variables ci-dessus sont correctement configurés.
-3. Laisser `BASELINE_ONLY=true` et lancer Actions → SoundCampaign Monitor → Run workflow. Cette exécution enregistre le nombre initial de soumissions sans notification.
-4. Après le succès, régler `BASELINE_ONLY=false` dans les variables GitHub.
-5. Les exécutions ultérieures envoient une notification Pushover uniquement lorsque `meta.itemCount` augmente.
+Ce token sert uniquement à demander la clé publique du dépôt, chiffrer la nouvelle valeur avec Libsodium, puis mettre à jour le secret `SOUND_CAMPAIGN_STORAGE_STATE` via l'API GitHub. Le contenu de la session n'est jamais envoyé en clair à l'API GitHub.
 
-## Limite importante
+Si `SESSION_SYNC_TOKEN` est absent ou invalide, le monitoring continue normalement après une vérification SoundCampaign réussie, mais la synchronisation de session n'est pas effectuée ; un avertissement est inscrit dans les logs Actions.
 
-La détection repose sur le nombre total `meta.itemCount`, pas sur des identifiants individuels. Si une soumission disparaît au même moment qu'une autre arrive, le nombre peut rester identique et cette arrivée pourrait ne pas être signalée. Ce choix évite d'enregistrer ou d'afficher les détails des morceaux.
+## Création / renouvellement initial de la session
 
-Le cron `*/5 * * * *` demande une exécution toutes les cinq minutes, mais GitHub Actions peut retarder les lancements. Vérifier que l'automatisation de navigation/lecture est autorisée par SoundCampaign et ne pas contourner les CAPTCHA, restrictions ou limites du service.
+Sur ton ordinateur, à la racine du dépôt :
 
-Ne jamais committer `storage-state.json` ni partager sa valeur : il contient des données de session.
+```bash
+npm install
+npx playwright install chromium
+npm run login
+```
+
+Le navigateur s'ouvre. Connecte-toi en tant que **Playlist Curator**, ouvre le Tracks Feed, puis reviens au terminal et appuie sur Entrée. `save-session.mjs` enregistre les cookies, le localStorage et IndexedDB dans `storage-state.json`.
+
+Le fichier `storage-state.json` est un identifiant de session sensible. Il est ignoré par Git via `.gitignore`. Ne le commite pas et ne le partage pas.
+
+Encode ensuite le fichier en Base64 et remplace une fois le secret `SOUND_CAMPAIGN_STORAGE_STATE` :
+
+```bash
+node -e "process.stdout.write(require('fs').readFileSync('storage-state.json').toString('base64'))"
+```
+
+Copier la sortie dans le secret GitHub. Sur PowerShell, tu peux directement mettre le résultat dans le presse-papiers :
+
+```powershell
+node -e "process.stdout.write(require('fs').readFileSync('storage-state.json').toString('base64'))" | Set-Clipboard
+```
+
+## Synchronisation automatique de la session
+
+Après une réponse API authentifiée et un JSON valide, `monitor.mjs` capture le nouvel état du navigateur avec `indexedDB: true`. Si l'état a changé, il :
+
+1. sérialise l'état du navigateur ;
+2. l'encode en Base64, comme attendu par l'étape de restauration du workflow ;
+3. récupère la clé publique du dépôt GitHub ;
+4. chiffre la valeur avec `libsodium-wrappers` ;
+5. met à jour le secret `SOUND_CAMPAIGN_STORAGE_STATE`.
+
+La synchronisation est tentée uniquement après une vérification API réussie. Une erreur de synchronisation produit un avertissement et n'annule pas une vérification valide ni une notification Pushover.
+
+Cette fonction conserve les éventuels cookies ou jetons renouvelés par SoundCampaign. Elle ne peut pas prolonger une durée de session maximale imposée côté serveur. Si SoundCampaign redirige vers la connexion, il faut renouveler manuellement la session avec `npm run login` et mettre à jour le secret initial.
+
+Le token GitHub `SESSION_SYNC_TOKEN` peut lui-même expirer ou être révoqué ; dans ce cas, il faudra le renouveler.
+
+## Vérification
+
+Lancer **Actions → SoundCampaign Monitor → Run workflow**. Dans les logs, rechercher notamment :
+
+- `SoundCampaign response received: HTTP 200` ;
+- `SoundCampaign browser state changed and was securely synchronized to GitHub.` ou `SoundCampaign browser state is unchanged...` ;
+- un éventuel avertissement `Automatic SoundCampaign session sync failed`.
+
+Ne jamais conclure qu'il n'y a aucune soumission si l'authentification, la requête API ou la lecture du JSON échoue.
+
+## Sécurité
+
+- Ne jamais commiter `storage-state.json`.
+- Ne jamais publier `SOUND_CAMPAIGN_STORAGE_STATE` ou `SESSION_SYNC_TOKEN`.
+- Ne jamais coller les contenus de ces secrets dans une issue, un log ou une conversation.
+- Le workflow ne sauvegarde la session qu'après validation d'une réponse API réussie.

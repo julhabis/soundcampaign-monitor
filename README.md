@@ -56,16 +56,10 @@ Le navigateur s'ouvre. Connecte-toi en tant que **Playlist Curator**, ouvre le T
 
 Le fichier `storage-state.json` est un identifiant de session sensible. Il est ignoré par Git via `.gitignore`. Ne le commite pas et ne le partage pas.
 
-Encode ensuite le fichier en Base64 et remplace une fois le secret `SOUND_CAMPAIGN_STORAGE_STATE` :
-
-```bash
-node -e "process.stdout.write(require('fs').readFileSync('storage-state.json').toString('base64'))"
-```
-
-Copier la sortie dans le secret GitHub. Sur PowerShell, tu peux directement mettre le résultat dans le presse-papiers :
+Encode ensuite le fichier en Base64 et il sera copié avec cette commande (remplace ensuite le secret `SOUND_CAMPAIGN_STORAGE_STATE`) :
 
 ```powershell
-node -e "process.stdout.write(require('fs').readFileSync('storage-state.json').toString('base64'))" | Set-Clipboard
+node -e "process.stdout.write(require('fs').readFileSync('storage-state.json').toString('base64'))" | pbcopy
 ```
 
 ## Synchronisation automatique de la session
